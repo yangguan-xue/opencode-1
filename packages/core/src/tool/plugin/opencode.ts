@@ -10,6 +10,7 @@ import { Effect, Schema } from "effect"
 import { FileAccess } from "../../file-access.js"
 import { Git } from "../../git.js"
 import { Permission } from "../../permission.js"
+import { Project } from "../../project.js"
 import { Worktree } from "../../worktree.js"
 
 export const RenameInput = Schema.Struct({
@@ -30,6 +31,15 @@ const MoveOutput = Schema.Struct({ sessionID: Session.ID, directory: AbsolutePat
 
 export const WorktreeCreateInput = Schema.Struct({
   name: Schema.Trim.check(Schema.isNonEmpty()).annotate({ description: "Worktree name." }),
+})
+
+export const WorktreeListInput = Schema.Struct({
+  directory: Schema.optionalKey(
+    AbsolutePath.check(Schema.isMinLength(1)).annotate({
+      description:
+        "Path to a repository or worktree, relative to the current directory or absolute. Defaults to the current repository.",
+    }),
+  ),
 })
 
 export const WorktreeRemoveInput = Schema.Struct({
@@ -96,6 +106,7 @@ export const Plugin = {
   effect: Effect.fn("OpenCodeTools.Plugin")(function* (ctx: Context) {
     const access = yield* FileAccess.Service
     const permission = yield* Permission.Service
+    const projects = yield* Project.Service
     const hook = (event: SessionHooks["context"]) =>
       Effect.sync(() => {
         event.system.push(
@@ -176,13 +187,35 @@ export const Plugin = {
         draft.add({
           name: "worktree_list",
           description: "List a repository's worktrees.",
-          input: Schema.Struct({}),
+          input: WorktreeListInput,
           output: Schema.Struct({ worktrees: Worktree.List }),
           options: { namespace: "opencode", codemode: true, pinned: true },
-          execute: () =>
-            ctx.worktree.list({ projectID: ctx.location.project.id }).pipe(
-              Effect.map((worktrees) => ({ output: { worktrees } })),
-              Effect.mapError((error) => new ToolFailure({ message: "Unable to list worktrees", error })),
+          execute: (input, context) =>
+            Effect.gen(function* () {
+              const session = context?.sessionID
+                ? yield* ctx.session.get({ sessionID: context.sessionID }).pipe(Effect.orElseSucceed(() => undefined))
+                : undefined
+              const base = session?.location.directory ?? ctx.location.directory
+              const resolved = input.directory ? FileAccess.resolvePath(base, input.directory) : base
+              const target = yield* access.resolve({ path: resolved, kind: "directory" })
+              yield* access.authorizeExternal([target], context)
+              const project = yield* projects.resolve(target.absolute)
+              if (!project.vcs) {
+                return yield* new ToolFailure({
+                  message: input.directory
+                    ? `Unable to list worktrees: ${target.absolute} is not in a git repository.`
+                    : `Unable to list worktrees: current directory (${target.absolute}) is not in a git repository.`,
+                })
+              }
+              yield* ctx.worktree.refresh({ projectID: project.id })
+              const worktrees = yield* ctx.worktree.list({ projectID: project.id })
+              return { output: { worktrees } }
+            }).pipe(
+              Effect.mapError((error) =>
+                error instanceof ToolFailure
+                  ? error
+                  : new ToolFailure({ message: "Unable to list worktrees", error }),
+              ),
             ),
         })
         draft.add({

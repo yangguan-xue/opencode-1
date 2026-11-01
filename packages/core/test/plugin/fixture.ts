@@ -33,6 +33,7 @@ import { PersistentPty } from "@opencode/core/persistent-pty"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Permission } from "@opencode/core/permission"
+import { Project } from "@opencode/core/project"
 import { Reference } from "@opencode/core/reference"
 import { Rpc } from "@opencode/core/rpc"
 import { Skill } from "@opencode/core/skill"
@@ -120,6 +121,7 @@ export const makePluginTestLayer = (permission = permissionLayer, generate = gen
       PersistentPty.node,
       LocationServiceMap.node,
       Permission.node,
+      Project.node,
       PluginHooks.node,
       Reference.node,
       Rpc.node,

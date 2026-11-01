@@ -1,3 +1,4 @@
+import { $ } from "bun"
 import { expect } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
@@ -14,7 +15,9 @@ import { Tool } from "@opencode/core/tool"
 import { OpenCodeTools } from "@opencode/core/tool/plugin/opencode"
 import { WorktreeTable } from "@opencode/core/worktree/sql"
 import { WorktreeStrategies } from "@opencode/core/worktree/strategies"
+import { Global } from "@opencode/util/global"
 import { Model } from "@opencode/schema/model"
+import { eq } from "drizzle-orm"
 import { Effect } from "effect"
 import { initRepo } from "./fixture/git"
 import { tmpdirScoped } from "./fixture/tmpdir"
@@ -144,16 +147,18 @@ it.effect("groups available models by provider with paging", () =>
   }),
 )
 
-const approvals = { assertions: [] as Permission.AssertInput[], rejectEdit: false }
+const approvals = { assertions: [] as Permission.AssertInput[], rejectEdit: false, rejectExternal: false }
 const worktreeIt = testEffect(
   makePluginTestLayer(
     permissionLayer({
       assert: (input) =>
         Effect.sync(() => approvals.assertions.push(input)).pipe(
           Effect.andThen(
-            approvals.rejectEdit && input.action === "edit"
-              ? Effect.fail(new Permission.CorrectedError({ feedback: "Keep this worktree" }))
-              : Effect.void,
+            approvals.rejectExternal && input.action === "external_directory"
+              ? Effect.fail(new Permission.CorrectedError({ feedback: "Denied external directory" }))
+              : approvals.rejectEdit && input.action === "edit"
+                ? Effect.fail(new Permission.CorrectedError({ feedback: "Keep this worktree" }))
+                : Effect.void,
           ),
         ),
     }),
@@ -259,5 +264,147 @@ worktreeIt.live("creates, lists, and removes worktrees for the plugin's project"
       { action: "edit", resources: [resource], save: ["*"], sessionID: session.id },
     ])
     expect((yield* run("worktree_list", {})).worktrees).not.toContainEqual({ directory, strategy: "git" })
+
+    // External git worktree add is reconciled on list
+    const external = path.join(parent.path, "external-wt")
+    yield* Effect.promise(() => $`git -C ${location.directory} worktree add --detach ${external} HEAD`.quiet())
+    expect((yield* run("worktree_list", {})).worktrees).toContainEqual({ directory: external, strategy: "git" })
+
+    // Deleted worktree directory on disk is pruned on list
+    yield* Effect.promise(() => fs.rm(external, { recursive: true, force: true }))
+    expect((yield* run("worktree_list", {})).worktrees).not.toContainEqual({ directory: external, strategy: "git" })
+  }),
+)
+
+worktreeIt.live("worktree_list handles sessions outside git repository and explicit directory argument", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const sessions = yield* Session.Service
+    const location = yield* Location.Service
+    const strategies = yield* WorktreeStrategies.Service
+    const database = yield* Database.Service
+    const parent = yield* tmpdirScoped()
+    const nonGit = yield* tmpdirScoped()
+
+    yield* Effect.promise(() => initRepo(location.directory))
+    yield* database.db
+      .insert(ProjectTable)
+      .values({
+        id: location.project.id,
+        worktree: location.directory,
+        sandboxes: [],
+        time_created: 1,
+        time_updated: 1,
+      })
+      .onConflictDoUpdate({ target: ProjectTable.id, set: { worktree: location.directory } })
+      .run()
+      .pipe(Effect.orDie)
+    yield* database.db
+      .insert(WorktreeTable)
+      .values({ project_id: location.project.id, directory: location.directory })
+      .onConflictDoNothing()
+      .run()
+      .pipe(Effect.orDie)
+    yield* strategies.transform((editor) => editor.configure({ directory: AbsolutePath.make(parent.path) }))
+    yield* OpenCodeTools.Plugin.effect(yield* PluginHost.make(plugins))
+
+    const outsideSession = yield* sessions.create({
+      location: Location.Ref.make({ directory: AbsolutePath.make(nonGit.path) }),
+    })
+    const registry = yield* Tool.Service
+    const program = (code: string) =>
+      executeTool(registry, {
+        sessionID: outsideSession.id,
+        ...toolIdentity,
+        call: { type: "tool-call", id: `call-${code}`, name: "execute", input: { code } },
+      })
+    const call = (name: string, input: Record<string, unknown>) =>
+      program(`return await tools.opencode.${name}(${JSON.stringify(input)})`)
+    const run = (name: string, input: Record<string, unknown>) =>
+      call(name, input).pipe(
+        Effect.map((result) => JSON.parse(result.content?.[0]?.type === "text" ? result.content[0].text : "")),
+      )
+
+    // 1. Outside repo without directory argument fails loudly
+    expect(yield* call("worktree_list", {})).toMatchObject({
+      content: [
+        {
+          type: "text",
+          text: expect.stringContaining("is not in a git repository"),
+        },
+      ],
+      metadata: { error: true },
+    })
+
+    // 2. Outside repo with directory pointing to non-git directory fails loudly
+    expect(yield* call("worktree_list", { directory: nonGit.path })).toMatchObject({
+      content: [
+        {
+          type: "text",
+          text: expect.stringContaining("is not in a git repository"),
+        },
+      ],
+      metadata: { error: true },
+    })
+
+    // 3. Outside repo with directory pointing to valid repo succeeds
+    const result = yield* run("worktree_list", { directory: location.directory })
+    expect(result.worktrees).toContainEqual({ directory: location.directory, strategy: undefined })
+
+    // 4. Session relative path resolves against session directory (not location.directory)
+    const subRepo = path.join(nonGit.path, "relative-sub-repo")
+    yield* Effect.promise(() => initRepo(subRepo))
+    const relResult = yield* run("worktree_list", { directory: "relative-sub-repo" })
+    expect(relResult.worktrees).toContainEqual({ directory: subRepo, strategy: undefined })
+
+    // 5. ~ path expansion resolves against user home directory
+    const homeRepoName = `review-60768-${crypto.randomUUID().slice(0, 8)}`
+    const homeRepoDir = path.join(Global.Path.home, homeRepoName)
+    yield* Effect.promise(() => initRepo(homeRepoDir))
+    try {
+      const homeResult = yield* run("worktree_list", { directory: `~/${homeRepoName}` })
+      expect(homeResult.worktrees).toContainEqual({ directory: homeRepoDir, strategy: undefined })
+    } finally {
+      yield* Effect.promise(() => fs.rm(homeRepoDir, { recursive: true, force: true }))
+    }
+
+    // 6. External directory authorization (allowed path)
+    const externalRepo = yield* tmpdirScoped()
+    yield* Effect.promise(() => initRepo(externalRepo.path))
+    approvals.assertions.length = 0
+    approvals.rejectExternal = false
+    const allowedResult = yield* run("worktree_list", { directory: externalRepo.path })
+    expect(allowedResult.worktrees).toContainEqual({ directory: externalRepo.path, strategy: undefined })
+    expect(approvals.assertions).toContainEqual(
+      expect.objectContaining({ action: "external_directory", sessionID: outsideSession.id }),
+    )
+
+    // 7. External directory authorization (denied path aborts before projects.resolve/persist)
+    const deniedRepo = yield* tmpdirScoped()
+    yield* Effect.promise(() => initRepo(deniedRepo.path))
+    approvals.assertions.length = 0
+    approvals.rejectExternal = true
+    expect(yield* call("worktree_list", { directory: deniedRepo.path })).toMatchObject({
+      content: [{ type: "text", text: "Denied external directory" }],
+      metadata: { error: true },
+    })
+    expect(approvals.assertions).toContainEqual(
+      expect.objectContaining({ action: "external_directory", sessionID: outsideSession.id }),
+    )
+    const inDb = yield* database.db
+      .select()
+      .from(ProjectTable)
+      .where(eq(ProjectTable.worktree, AbsolutePath.make(deniedRepo.path)))
+      .get()
+      .pipe(Effect.orDie)
+    expect(inDb).toBeUndefined()
+    const inWorktree = yield* database.db
+      .select()
+      .from(WorktreeTable)
+      .where(eq(WorktreeTable.directory, AbsolutePath.make(deniedRepo.path)))
+      .get()
+      .pipe(Effect.orDie)
+    expect(inWorktree).toBeUndefined()
+    approvals.rejectExternal = false
   }),
 )
